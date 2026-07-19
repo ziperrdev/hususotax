@@ -27,16 +27,34 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.38.0'
-          channel: 'stable'
-          # Disamain PERSIS dengan versi yang dipakai installer VPS
-          # (lihat worker/installer.js -> flutter_linux_3.38.0-stable.tar.xz)
-          # biar hasil build di GitHub Actions konsisten sama VPS.
-          # Flutter 3.38.0 -> Dart 3.10, sudah memenuhi constraint
-          # `sdk: ">=3.8.1 <4.0.0"` di pubspec.yaml project.
+      # PENTING: subosito/flutter-action@v2 dengan flutter-version: '3.38.0'
+      # ternyata narik build yang Dart SDK-nya ke-tag "3.10.0-290.4.beta"
+      # (bukan Dart 3.10.0 stable murni). Buat pub, versi beta dianggap
+      # LEBIH RENDAH dari versi release meski angkanya sama, jadi package
+      # yang butuh constraint `sdk: >=3.10.0` (mis. app_links ^7.0.0)
+      # gagal di-resolve walau sebenernya "kompatibel".
+      #
+      # Solusinya: download tarball resmi Flutter langsung, PERSIS sama
+      # dengan yang dipakai installer VPS (flutter_linux_3.38.0-stable.tar.xz),
+      # supaya Dart SDK yang ke-bundle beneran build stable/release, bukan
+      # snapshot beda yang di-resolve action.
+      - name: Setup Flutter (manual tarball, sama persis dengan VPS)
+        run: |
+          set -e
+          FLUTTER_VERSION="3.38.0"
+          curl -fL -o flutter_sdk.tar.xz \
+            "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+          mkdir -p "$HOME/flutter-sdk"
+          tar xf flutter_sdk.tar.xz -C "$HOME/flutter-sdk"
+          echo "$HOME/flutter-sdk/flutter/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter-sdk/flutter/bin/cache/dart-sdk/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Flutter & Dart version
+        run: |
+          export PATH="$HOME/flutter-sdk/flutter/bin:$HOME/flutter-sdk/flutter/bin/cache/dart-sdk/bin:$PATH"
+          flutter config --no-analytics
+          flutter --version
+          flutter precache --android
 
       # Beberapa plugin (awesome_notifications, geolocator, dartssh2, dll)
       # butuh Android SDK component / NDK yang belum tentu ke-download +
