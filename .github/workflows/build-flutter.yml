@@ -1,0 +1,172 @@
+name: Build Flutter APK (Fallback Worker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from Bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.0'
+          channel: 'stable'
+          # Disamain PERSIS dengan versi yang dipakai installer VPS
+          # (lihat worker/installer.js -> flutter_linux_3.38.0-stable.tar.xz)
+          # biar hasil build di GitHub Actions konsisten sama VPS.
+          # Flutter 3.38.0 -> Dart 3.10, sudah memenuhi constraint
+          # `sdk: ">=3.8.1 <4.0.0"` di pubspec.yaml project.
+
+      # Beberapa plugin (awesome_notifications, geolocator, dartssh2, dll)
+      # butuh Android SDK component / NDK yang belum tentu ke-download +
+      # ke-license di image runner. Auto-accept semua license biar
+      # sdkmanager gak nge-block proses build pas Gradle minta download.
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+
+      - name: Prepare Project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          echo '${{ github.event.inputs.payload }}' > payload.json
+          cat payload.json
+
+          # Bot bisa kirim salah satu dari 2 field ini tergantung mode upload
+          ASSET_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::Tidak ada zipAssetUrl atau url di payload. Isi payload:"
+            cat payload.json
+            exit 1
+          fi
+
+          echo "Downloading project source from: $ASSET_URL"
+
+          rm -rf project project.zip
+          mkdir -p project
+
+          if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
+            # GitHub Release asset API url -> perlu auth header + Accept octet-stream
+            curl -fL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip \
+              "$ASSET_URL"
+          else
+            # Public URL biasa
+            curl -fL -o project.zip "$ASSET_URL"
+          fi
+
+          unzip -q project.zip -d project
+
+          # Beberapa ZIP punya folder pembungkus tambahan (mis: project/myapp/pubspec.yaml)
+          # Auto-detect lokasi pubspec.yaml biar gak salah cd
+          PUBSPEC=$(find project -maxdepth 5 -type f -name pubspec.yaml | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ini project Flutter yang valid."
+            find project -maxdepth 3
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(dirname "$PUBSPEC")
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Detected Flutter project root: $PROJECT_ROOT"
+
+      # Cache pub packages. Key pakai isi pubspec.yaml project hasil unzip
+      # (bukan repo checkout), karena project sebenarnya ada di $PROJECT_ROOT
+      # yang baru ketahuan setelah step "Prepare Project".
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('project/**/pubspec.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      # Cache Gradle. Project ini punya banyak dependency native
+      # (video_player, webview, hive, awesome_notifications, dll) yang
+      # bikin proses resolve + compile Gradle lumayan berat, jadi caching
+      # signifikan mempercepat run berikutnya.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('project/**/*.gradle*', 'project/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # Project pakai banyak dependency berat (better_player, dartssh2,
+      # video_player, awesome_notifications, dll) sehingga Gradle build
+      # sering butuh heap lebih besar dari default runner. Naikkan
+      # org.gradle.jvmargs kalau file gradle.properties ada, atau buat
+      # baru kalau belum ada.
+      - name: Bump Gradle memory
+        run: |
+          set -e
+          GRADLE_PROPS="$PROJECT_ROOT/android/gradle.properties"
+          if [ -f "$GRADLE_PROPS" ]; then
+            if grep -q "^org.gradle.jvmargs" "$GRADLE_PROPS"; then
+              sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4608M -XX:MaxMetaspaceSize=1024M/' "$GRADLE_PROPS"
+            else
+              echo "org.gradle.jvmargs=-Xmx4608M -XX:MaxMetaspaceSize=1024M" >> "$GRADLE_PROPS"
+            fi
+          else
+            mkdir -p "$PROJECT_ROOT/android"
+            echo "org.gradle.jvmargs=-Xmx4608M -XX:MaxMetaspaceSize=1024M" >> "$GRADLE_PROPS"
+          fi
+          echo "----- gradle.properties -----"
+          cat "$GRADLE_PROPS"
+
+      - name: Build APK
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          flutter pub get
+          flutter clean
+          flutter pub get
+          flutter build apk --release
+
+      - name: Locate APK
+        run: |
+          set -e
+          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "app-release.apk" -path "*/flutter-apk/*" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::app-release.apk tidak ditemukan setelah build."
+            find "$PROJECT_ROOT/build" -maxdepth 5 2>/dev/null || true
+            exit 1
+          fi
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "Found APK at: $APK_PATH"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.APK_PATH }}
